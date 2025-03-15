@@ -27,3 +27,6 @@ android_logger = "0.13"
 
 [target.x86_64-linux-android.dependencies]
 android_logger = "0.13"
+
+[target.i686-linux-android.dependencies]
+android_logger = "0.13"
