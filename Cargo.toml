@@ -52,6 +52,10 @@ android_logger = "0.13"
 jni = "0.21"
 android_logger = "0.13"
 
+[target.i686-linux-android.dependencies]
+jni = "0.21"
+android_logger = "0.13"
+
 [profile.release]
 opt-level = "z"
 strip = true
