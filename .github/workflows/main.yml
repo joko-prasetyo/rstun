@@ -344,7 +344,6 @@ jobs:
       - run: cargo install cross --git https://github.com/cross-rs/cross
       - name: Clone rs-utilities
         run: |
-          git clone https://github.com/neevek/rs-utilities.git
           sed -i 's|rs-utilities = { path = "./rs-utilities" }|rs-utilities = { path = "rs-utilities" }|g' Cargo.toml
       - name: Add android_logger dependency
         run: |
