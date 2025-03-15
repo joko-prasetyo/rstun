@@ -342,13 +342,6 @@ jobs:
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r25c" >> $GITHUB_ENV
       - run: rustup target add x86_64-linux-android
       - run: cargo install cross --git https://github.com/cross-rs/cross
-      - name: Add android_logger dependency
-        run: |
-          if ! grep -q "android_logger" Cargo.toml; then
-            echo 'Adding android_logger dependency'
-            echo '[target.x86_64-linux-android.dependencies]' >> Cargo.toml
-            echo 'android_logger = "0.13"' >> Cargo.toml
-          fi
       - run: cross build --all-features --release --target x86_64-linux-android
       - run: mkdir -p rstun-android-x86_64
       - run: mv target/x86_64-linux-android/release/rstunc ./rstun-android-x86_64/
