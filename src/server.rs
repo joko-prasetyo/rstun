@@ -16,21 +16,24 @@ use quinn::VarInt;
 use quinn::{congestion, Connection, Endpoint, SendStream, TransportConfig};
 use rs_utilities::log_and_bail;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::net::SocketAddr;
+use std::io::ErrorKind;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, Once};
 use tokio::net::TcpStream;
-use tokio::time::Duration;
+use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Clone)]
 struct ConnectedTcpInSession {
     conn: Connection,
     sender: StreamSender<TcpStream>,
+    bind_addr: SocketAddr,
 }
 
 #[derive(Debug, Clone)]
 struct ConnectedUdpInSession {
     conn: Connection,
     sender: UdpSender,
+    bind_addr: SocketAddr,
 }
 
 #[derive(Debug)]
@@ -162,7 +165,8 @@ impl Server {
             let config = inner_state!(self, config).clone();
             tokio::spawn(async move {
                 let client_conn = client_conn.await?;
-                let tun_type = Self::authenticate_connection(&config, client_conn).await?;
+                let tun_type =
+                    Self::authenticate_connection(&state, &config, client_conn).await?;
 
                 match tun_type {
                     TunnelType::TcpOut(info) => {
@@ -191,6 +195,7 @@ impl Server {
                             .push(ConnectedTcpInSession {
                                 conn: info.conn.clone(),
                                 sender: info.tcp_server.clone_sender(),
+                                bind_addr: info.tcp_server.addr(),
                             });
 
                         let mut tcp_receiver = info.tcp_server.take_receiver();
@@ -215,6 +220,7 @@ impl Server {
                             .push(ConnectedUdpInSession {
                                 conn: info.conn.clone(),
                                 sender: info.udp_server.clone_sender(),
+                                bind_addr: info.udp_server.addr(),
                             });
 
                         let mut udp_receiver = info.udp_server.take_receiver();
@@ -247,6 +253,7 @@ impl Server {
     }
 
     async fn authenticate_connection(
+        state: &Arc<Mutex<State>>,
         config: &ServerConfig,
         conn: quinn::Connection,
     ) -> Result<TunnelType> {
@@ -267,8 +274,14 @@ impl Server {
 
                 let tunnel_type = match login_info.tunnel {
                     Tunnel::NetworkBased(tunnel_config) => {
-                        Self::derive_tunnel_type(conn, &mut quic_send, &tunnel_config, config)
-                            .await?
+                        Self::derive_tunnel_type(
+                            state,
+                            conn,
+                            &mut quic_send,
+                            &tunnel_config,
+                            config,
+                        )
+                        .await?
                     }
                     Tunnel::ChannelBased(upstream_type) => match upstream_type {
                         UpstreamType::Tcp => TunnelType::DynamicUpstreamTcpOut(conn),
@@ -288,6 +301,7 @@ impl Server {
     }
 
     async fn derive_tunnel_type(
+        state: &Arc<Mutex<State>>,
         conn: quinn::Connection,
         quic_send: &mut SendStream,
         tunnel_config: &TunnelConfig,
@@ -316,12 +330,13 @@ impl Server {
 
             TunnelMode::In => match tunnel_config.upstream.upstream_type {
                 UpstreamType::Tcp => {
-                    let tcp_server = match TcpServer::bind_and_start(upstream_addr).await {
-                        Ok(tcp_server) => tcp_server,
+                    let tcp_server =
+                        match Self::bind_tcp_with_takeover(state, upstream_addr).await {
+                            Ok(server) => server,
                         Err(e) => {
                             TunnelMessage::send_failure(
                                 quic_send,
-                                format!("udp server failed to bind at: {upstream_addr}"),
+                                format!("tcp server failed to bind at: {upstream_addr}"),
                             )
                             .await?;
                             log_and_bail!("tcp_IN login rejected: {e}");
@@ -333,8 +348,9 @@ impl Server {
                 }
 
                 UpstreamType::Udp => {
-                    let udp_server = match UdpServer::bind_and_start(upstream_addr).await {
-                        Ok(udp_server) => udp_server,
+                    let udp_server =
+                        match Self::bind_udp_with_takeover(state, upstream_addr).await {
+                            Ok(server) => server,
                         Err(e) => {
                             TunnelMessage::send_failure(
                                 quic_send,
@@ -371,7 +387,7 @@ impl Server {
                     );
                 }
 
-                default_upstream.unwrap()
+                (*default_upstream).expect("default upstream must be present")
             }
 
             Some(addr) => {
@@ -396,7 +412,11 @@ impl Server {
                 let sess = sess.clone();
                 tokio::spawn(async move {
                     sess.sender.send(UdpMessage::Quit).await.ok();
-                    debug!("dropped udp session: {}", sess.conn.remote_address());
+                    debug!(
+                        "dropped udp session: {} ({})",
+                        sess.conn.remote_address(),
+                        sess.bind_addr
+                    );
                 });
                 false
             } else {
@@ -409,13 +429,147 @@ impl Server {
                 let sess = sess.clone();
                 tokio::spawn(async move {
                     sess.sender.send(StreamMessage::Quit).await.ok();
-                    debug!("dropped tcp session: {}", sess.conn.remote_address());
+                    debug!(
+                        "dropped tcp session: {} ({})",
+                        sess.conn.remote_address(),
+                        sess.bind_addr
+                    );
                 });
                 false
             } else {
                 true
             }
         });
+    }
+
+    async fn bind_tcp_with_takeover(
+        state: &Arc<Mutex<State>>,
+        addr: SocketAddr,
+    ) -> Result<TcpServer> {
+        const MAX_ATTEMPTS: usize = 5;
+        let mut attempts = 0usize;
+
+        loop {
+            match TcpServer::bind_and_start(addr).await {
+                Ok(server) => return Ok(server),
+                Err(err) => {
+                    if Self::is_addr_in_use(&err) && attempts < MAX_ATTEMPTS {
+                        attempts += 1;
+                        if Self::request_tcp_takeover(state, addr).await? {
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    async fn bind_udp_with_takeover(
+        state: &Arc<Mutex<State>>,
+        addr: SocketAddr,
+    ) -> Result<UdpServer> {
+        const MAX_ATTEMPTS: usize = 5;
+        let mut attempts = 0usize;
+
+        loop {
+            match UdpServer::bind_and_start(addr).await {
+                Ok(server) => return Ok(server),
+                Err(err) => {
+                    if Self::is_addr_in_use(&err) && attempts < MAX_ATTEMPTS {
+                        attempts += 1;
+                        if Self::request_udp_takeover(state, addr).await? {
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    async fn request_tcp_takeover(
+        state: &Arc<Mutex<State>>,
+        addr: SocketAddr,
+    ) -> Result<bool> {
+        let sessions = {
+            let mut guard = state.lock().unwrap();
+            let mut victims = Vec::new();
+            guard.tcp_sessions.retain(|sess| {
+                if Self::addr_conflicts(sess.bind_addr, addr) {
+                    victims.push(sess.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            victims
+        };
+
+        if sessions.is_empty() {
+            return Ok(false);
+        }
+
+        info!("taking over TCP tunnel bound at {addr}");
+
+        for sess in sessions {
+            sess.conn.close(VarInt::from_u32(0), b"takeover");
+            let _ = sess.sender.send(StreamMessage::Quit).await;
+        }
+
+        Ok(true)
+    }
+
+    async fn request_udp_takeover(
+        state: &Arc<Mutex<State>>,
+        addr: SocketAddr,
+    ) -> Result<bool> {
+        let sessions = {
+            let mut guard = state.lock().unwrap();
+            let mut victims = Vec::new();
+            guard.udp_sessions.retain(|sess| {
+                if Self::addr_conflicts(sess.bind_addr, addr) {
+                    victims.push(sess.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            victims
+        };
+
+        if sessions.is_empty() {
+            return Ok(false);
+        }
+
+        info!("taking over UDP tunnel bound at {addr}");
+
+        for sess in sessions {
+            sess.conn.close(VarInt::from_u32(0), b"takeover");
+            let _ = sess.sender.send(UdpMessage::Quit).await;
+        }
+
+        Ok(true)
+    }
+
+    fn addr_conflicts(existing: SocketAddr, requested: SocketAddr) -> bool {
+        if existing.port() != requested.port() {
+            return false;
+        }
+
+        match (existing.ip(), requested.ip()) {
+            (IpAddr::V4(e), IpAddr::V4(r)) => e.is_unspecified() || r.is_unspecified() || e == r,
+            (IpAddr::V6(e), IpAddr::V6(r)) => e.is_unspecified() || r.is_unspecified() || e == r,
+            _ => false,
+        }
+    }
+
+    fn is_addr_in_use(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<std::io::Error>()
+            .map(|io_err| io_err.kind() == ErrorKind::AddrInUse)
+            .unwrap_or(false)
     }
 
     fn read_certs_and_key(

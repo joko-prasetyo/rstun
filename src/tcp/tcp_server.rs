@@ -1,7 +1,7 @@
 use crate::tcp::{StreamMessage, StreamReceiver, StreamRequest, StreamSender};
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -98,13 +98,29 @@ impl TcpServer {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        let addr = {
+        let (addr, wake_addr) = {
             let mut state = self.state.lock().unwrap();
             state.terminated = true;
-            state.addr
+            let addr = state.addr;
+            let wake_addr = match addr.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => {
+                    SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())
+                }
+                IpAddr::V6(ip) if ip.is_unspecified() => {
+                    SocketAddr::new(Ipv6Addr::LOCALHOST.into(), addr.port())
+                }
+                _ => addr,
+            };
+            (addr, wake_addr)
         };
+
         // initiate a new connection to wake up the accept() loop
-        TcpStream::connect(addr).await?;
+        if let Err(e) = TcpStream::connect(wake_addr).await {
+            warn!(
+                "failed to nudge tcp listener at {addr} using {wake_addr}: {e}; \
+                 you may need to poke the listener manually"
+            );
+        }
         Ok(())
     }
 

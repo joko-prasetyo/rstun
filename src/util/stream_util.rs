@@ -38,11 +38,11 @@ impl StreamUtil {
         quic_stream: (SendStream, RecvStream),
         stream_timeout_ms: u64,
     ) {
-        let peer_addr = match stream.peer_addr() {
-            Ok(addr) => addr,
+        let peer_addr_repr = match stream.peer_addr() {
+            Ok(addr) => addr.to_string(),
             Err(e) => {
-                log::error!("failed to obtain peer address:{e}");
-                return;
+                log::debug!("stream peer address unavailable: {e}");
+                String::from("<not connected>")
             }
         };
 
@@ -50,12 +50,13 @@ impl StreamUtil {
         let (mut quic_send, mut quic_recv) = quic_stream;
         let index = quic_send.id().index();
 
-        debug!("[{tag}] START {index:<3} →  {peer_addr:<20}");
+        debug!("[{tag}] START {index:<3} →  {peer_addr_repr:<20}");
 
         let (quic_to_stream_tx, quic_to_stream_rx) = oneshot::channel::<()>();
         let (stream_to_quic_tx, stream_to_quic_rx) = oneshot::channel::<()>();
         const BUFFER_SIZE: usize = 8192;
 
+        let peer_addr_repr_clone = peer_addr_repr.clone();
         tokio::spawn(async move {
             let mut transfer_bytes = 0u64;
             let mut buffer = BUFFER_POOL.alloc_and_fill(BUFFER_SIZE);
@@ -89,7 +90,9 @@ impl StreamUtil {
                 }
             }
 
-            debug!("[{tag}] END  {index:<5}→  {peer_addr}, {transfer_bytes} bytes");
+            debug!(
+                "[{tag}] END  {index:<5}→  {peer_addr_repr_clone}, {transfer_bytes} bytes"
+            );
         });
 
         tokio::spawn(async move {
@@ -125,7 +128,9 @@ impl StreamUtil {
                 }
             }
 
-            debug!("[{tag}] END  {index:<4}←  {peer_addr}, {transfer_bytes} bytes");
+            debug!(
+                "[{tag}] END  {index:<4}←  {peer_addr_repr}, {transfer_bytes} bytes"
+            );
             Ok::<(), anyhow::Error>(())
         });
     }
