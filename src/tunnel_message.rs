@@ -1,6 +1,7 @@
-use crate::Upstream;
+use crate::{Tunnel, TunnelMode};
 use anyhow::Result;
 use anyhow::{bail, Context};
+use bincode::config::{self, Configuration};
 use enum_as_inner::EnumAsInner;
 use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
@@ -11,32 +12,82 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(EnumAsInner, Serialize, Deserialize, Debug, Clone)]
 pub enum TunnelMessage {
-    ReqTcpInLogin(LoginInfo),
-    ReqTcpOutLogin(LoginInfo),
-    ReqUdpInLogin(LoginInfo),
-    ReqUdpOutLogin(LoginInfo),
-    ReqUdpStart(UdpLocalAddr),
+    ReqLogin(LoginInfo),
+    ReqUdpStart(UdpPeerAddr),
     RespFailure(String),
     RespSuccess,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct LoginInfo {
+pub(crate) struct LoginInfo {
     pub password: String,
-    pub upstream: Upstream,
+    pub tunnel: Tunnel,
+}
+
+impl LoginInfo {
+    pub fn format_with_remote_addr(&self, remote_addr: &SocketAddr) -> String {
+        match &self.tunnel {
+            Tunnel::ChannelBased(upstream_type) => {
+                format!("{upstream_type}_ChannelBased →  {remote_addr}")
+            }
+            Tunnel::NetworkBased(cfg) => {
+                let upstream = &cfg.upstream;
+                let upstream_str = if let Some(upstream) = upstream.upstream_addr {
+                    if upstream.ip().is_loopback() {
+                        format!("{}:{}", remote_addr.ip(), upstream.port())
+                    } else {
+                        format!("{upstream}")
+                    }
+                } else {
+                    String::from("PeerDefault")
+                };
+
+                match cfg.mode {
+                    TunnelMode::Out => {
+                        format!(
+                            "{}_OUT →  {} →  {remote_addr} →  {upstream_str}",
+                            upstream.upstream_type,
+                            cfg.local_server_addr.unwrap()
+                        )
+                    }
+                    TunnelMode::In => {
+                        format!(
+                            "{}_IN ←  {} ←  {remote_addr} ←  {upstream_str}",
+                            upstream.upstream_type,
+                            cfg.local_server_addr.unwrap()
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct UdpLocalAddr(pub SocketAddr);
+pub struct UdpPeerAddr(pub Option<SocketAddr>);
+
+impl Display for LoginInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.tunnel {
+            Tunnel::ChannelBased(upstream_type) => {
+                f.write_str(format!("{upstream_type}_ChannelBased").as_str())
+            }
+            Tunnel::NetworkBased(cfg) => {
+                f.write_str(format!("{}_{}", cfg.upstream.upstream_type, cfg.mode).as_str())
+            }
+        }
+    }
+}
 
 impl Display for TunnelMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ReqTcpInLogin(_) => f.write_str("tcp_in"),
-            Self::ReqTcpOutLogin(_) => f.write_str("tcp_out"),
-            Self::ReqUdpInLogin(_) => f.write_str("udp_in"),
-            Self::ReqUdpOutLogin(_) => f.write_str("udp_out"),
-            _ => f.write_str("tunnel message"),
+            Self::ReqLogin(login_info) => f.write_str(login_info.to_string().as_str()),
+            Self::ReqUdpStart(udp_peer_addr) => {
+                f.write_str(format!("udp_start:{udp_peer_addr:?}").as_str())
+            }
+            Self::RespFailure(msg) => f.write_str(format!("fail:{msg}").as_str()),
+            Self::RespSuccess => f.write_str("succeeded"),
         }
     }
 }
@@ -50,13 +101,17 @@ impl TunnelMessage {
             .await
             .context("read message failed")?;
 
-        let tun_msg =
-            bincode::deserialize::<TunnelMessage>(&msg).context("deserialize message failed")?;
-        Ok(tun_msg)
+        let tun_msg = bincode::serde::decode_from_slice::<TunnelMessage, Configuration>(
+            &msg,
+            config::standard(),
+        )
+        .context("deserialize message failed")?;
+        Ok(tun_msg.0)
     }
 
     pub async fn send(quic_send: &mut SendStream, msg: &TunnelMessage) -> Result<()> {
-        let msg = bincode::serialize(msg).context("serialize message failed")?;
+        let msg = bincode::serde::encode_to_vec(msg, config::standard())
+            .context("serialize message failed")?;
         quic_send.write_u32(msg.len() as u32).await?;
         quic_send.write_all(&msg).await?;
         Ok(())
