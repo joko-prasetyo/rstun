@@ -27,6 +27,7 @@ struct ConnectedTcpInSession {
     conn: Connection,
     sender: StreamSender<TcpStream>,
     bind_addr: SocketAddr,
+    server: TcpServer,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ struct ConnectedUdpInSession {
     conn: Connection,
     sender: UdpSender,
     bind_addr: SocketAddr,
+    server: UdpServer,
 }
 
 #[derive(Debug)]
@@ -188,6 +190,8 @@ impl Server {
                     }
 
                     TunnelType::TcpIn(mut info) => {
+                        let tcp_server_clone = info.tcp_server.clone();
+                        let bind_addr = tcp_server_clone.addr();
                         state
                             .lock()
                             .unwrap()
@@ -195,7 +199,8 @@ impl Server {
                             .push(ConnectedTcpInSession {
                                 conn: info.conn.clone(),
                                 sender: info.tcp_server.clone_sender(),
-                                bind_addr: info.tcp_server.addr(),
+                                bind_addr,
+                                server: tcp_server_clone,
                             });
 
                         let mut tcp_receiver = info.tcp_server.take_receiver();
@@ -213,6 +218,8 @@ impl Server {
                     }
 
                     TunnelType::UdpIn(mut info) => {
+                        let udp_server_clone = info.udp_server.clone();
+                        let bind_addr = udp_server_clone.addr();
                         state
                             .lock()
                             .unwrap()
@@ -220,7 +227,8 @@ impl Server {
                             .push(ConnectedUdpInSession {
                                 conn: info.conn.clone(),
                                 sender: info.udp_server.clone_sender(),
-                                bind_addr: info.udp_server.addr(),
+                                bind_addr,
+                                server: udp_server_clone,
                             });
 
                         let mut udp_receiver = info.udp_server.take_receiver();
@@ -517,6 +525,10 @@ impl Server {
         for sess in sessions {
             sess.conn.close(VarInt::from_u32(0), b"takeover");
             let _ = sess.sender.send(StreamMessage::Quit).await;
+            let mut server = sess.server.clone();
+            if let Err(e) = server.shutdown().await {
+                warn!("failed to shutdown previous tcp listener at {addr}: {e}");
+            }
         }
 
         Ok(true)
@@ -549,6 +561,10 @@ impl Server {
         for sess in sessions {
             sess.conn.close(VarInt::from_u32(0), b"takeover");
             let _ = sess.sender.send(UdpMessage::Quit).await;
+            let mut server = sess.server.clone();
+            if let Err(e) = server.shutdown().await {
+                warn!("failed to shutdown previous udp listener at {addr}: {e}");
+            }
         }
 
         Ok(true)
