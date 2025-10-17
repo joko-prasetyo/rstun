@@ -1,8 +1,8 @@
 #[macro_export]
 macro_rules! log_and_bail {
     ($($args:tt)*) => {
-        error!($($args)*);
-        bail!(format!($($args)*));
+        log::error!($($args)*);
+        anyhow::bail!(format!($($args)*));
     };
 }
 
