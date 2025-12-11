@@ -16,7 +16,7 @@ use quinn::VarInt;
 use quinn::{congestion, Connection, Endpoint, SendStream, TransportConfig};
 use rs_utilities::log_and_bail;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Once};
 use tokio::net::TcpStream;
@@ -43,6 +43,8 @@ struct State {
     // Track active IN tunnels by their bound address for session takeover
     active_tcp_tunnels: HashMap<SocketAddr, (Connection, TcpServer)>,
     active_udp_tunnels: HashMap<SocketAddr, (Connection, UdpServer)>,
+    // Track ports currently being bound to prevent race conditions
+    ports_being_bound: HashSet<SocketAddr>,
 }
 
 impl State {
@@ -54,6 +56,7 @@ impl State {
             udp_sessions: Vec::new(),
             active_tcp_tunnels: HashMap::new(),
             active_udp_tunnels: HashMap::new(),
+            ports_being_bound: HashSet::new(),
         }
     }
 }
@@ -338,6 +341,33 @@ impl Server {
 
             TunnelMode::In => match tunnel_config.upstream.upstream_type {
                 UpstreamType::Tcp => {
+                    // Wait if another client is currently binding this port
+                    let max_wait_attempts = 10;
+                    for attempt in 0..max_wait_attempts {
+                        let port_is_being_bound = {
+                            state.lock().unwrap().ports_being_bound.contains(&upstream_addr)
+                        };
+                        if port_is_being_bound {
+                            if attempt == max_wait_attempts - 1 {
+                                TunnelMessage::send_failure(
+                                    quic_send,
+                                    format!("tcp server port {} is busy, try again later", upstream_addr),
+                                )
+                                .await?;
+                                log_and_bail!("tcp_IN login rejected: port {} is being bound by another client", upstream_addr);
+                            }
+                            debug!("Port {} is being bound by another client, waiting... (attempt {})", upstream_addr, attempt + 1);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Mark this port as being bound
+                    {
+                        state.lock().unwrap().ports_being_bound.insert(upstream_addr);
+                    }
+
                     // Session takeover: check if there's an existing tunnel on this port
                     let existing_tunnel = {
                         state.lock().unwrap().active_tcp_tunnels.remove(&upstream_addr)
@@ -360,13 +390,17 @@ impl Server {
                                 sess.conn.stable_id() != old_conn.stable_id()
                             });
                         }
-                        // Small delay to ensure port is released
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // Longer delay to ensure port is released on Linux
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
 
                     let tcp_server = match TcpServer::bind_and_start(upstream_addr).await {
                         Ok(tcp_server) => tcp_server,
                         Err(e) => {
+                            // Remove from ports_being_bound on failure
+                            {
+                                state.lock().unwrap().ports_being_bound.remove(&upstream_addr);
+                            }
                             TunnelMessage::send_failure(
                                 quic_send,
                                 format!("tcp server failed to bind at: {upstream_addr}"),
@@ -376,10 +410,11 @@ impl Server {
                         }
                     };
 
-                    // Track this tunnel for future session takeover
+                    // Track this tunnel for future session takeover and remove from ports_being_bound
                     {
                         let mut state = state.lock().unwrap();
                         state.active_tcp_tunnels.insert(upstream_addr, (conn.clone(), tcp_server.clone()));
+                        state.ports_being_bound.remove(&upstream_addr);
                     }
 
                     TunnelMessage::send(quic_send, &TunnelMessage::RespSuccess).await?;
@@ -387,6 +422,33 @@ impl Server {
                 }
 
                 UpstreamType::Udp => {
+                    // Wait if another client is currently binding this port
+                    let max_wait_attempts = 10;
+                    for attempt in 0..max_wait_attempts {
+                        let port_is_being_bound = {
+                            state.lock().unwrap().ports_being_bound.contains(&upstream_addr)
+                        };
+                        if port_is_being_bound {
+                            if attempt == max_wait_attempts - 1 {
+                                TunnelMessage::send_failure(
+                                    quic_send,
+                                    format!("udp server port {} is busy, try again later", upstream_addr),
+                                )
+                                .await?;
+                                log_and_bail!("udp_IN login rejected: port {} is being bound by another client", upstream_addr);
+                            }
+                            debug!("Port {} is being bound by another client, waiting... (attempt {})", upstream_addr, attempt + 1);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Mark this port as being bound
+                    {
+                        state.lock().unwrap().ports_being_bound.insert(upstream_addr);
+                    }
+
                     // Session takeover: check if there's an existing tunnel on this port
                     let existing_tunnel = {
                         state.lock().unwrap().active_udp_tunnels.remove(&upstream_addr)
@@ -409,13 +471,17 @@ impl Server {
                                 sess.conn.stable_id() != old_conn.stable_id()
                             });
                         }
-                        // Small delay to ensure port is released
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        // Longer delay to ensure port is released on Linux
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
 
                     let udp_server = match UdpServer::bind_and_start(upstream_addr).await {
                         Ok(udp_server) => udp_server,
                         Err(e) => {
+                            // Remove from ports_being_bound on failure
+                            {
+                                state.lock().unwrap().ports_being_bound.remove(&upstream_addr);
+                            }
                             TunnelMessage::send_failure(
                                 quic_send,
                                 format!("udp server failed to bind at: {upstream_addr}"),
@@ -425,10 +491,11 @@ impl Server {
                         }
                     };
 
-                    // Track this tunnel for future session takeover
+                    // Track this tunnel for future session takeover and remove from ports_being_bound
                     {
                         let mut state = state.lock().unwrap();
                         state.active_udp_tunnels.insert(upstream_addr, (conn.clone(), udp_server.clone()));
+                        state.ports_being_bound.remove(&upstream_addr);
                     }
 
                     TunnelMessage::send(quic_send, &TunnelMessage::RespSuccess).await?;
