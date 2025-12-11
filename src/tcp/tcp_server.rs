@@ -1,6 +1,7 @@
 use crate::tcp::{StreamMessage, StreamReceiver, StreamRequest, StreamSender};
 use anyhow::Result;
 use log::{debug, error, info, warn};
+use socket2::{Domain, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +25,20 @@ struct State {
 
 impl TcpServer {
     pub async fn bind_and_start(addr: SocketAddr) -> Result<Self> {
-        let tcp_listener = TcpListener::bind(addr).await?;
+        // Use socket2 to set SO_REUSEADDR before binding
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, None)?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(128)?;
+
+        let std_listener: std::net::TcpListener = socket.into();
+        let tcp_listener = TcpListener::from_std(std_listener)?;
         let addr = tcp_listener.local_addr().unwrap();
 
         let (tcp_sender, tcp_receiver) = channel(4);

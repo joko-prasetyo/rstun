@@ -4,6 +4,7 @@ use anyhow::Result;
 use log::debug;
 use log::error;
 use log::info;
+use socket2::{Domain, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -26,7 +27,19 @@ struct State {
 
 impl UdpServer {
     pub async fn bind_and_start(addr: SocketAddr) -> Result<Self> {
-        let udp_socket = UdpSocket::bind(addr).await?;
+        // Use socket2 to set SO_REUSEADDR before binding
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, None)?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+
+        let std_socket: std::net::UdpSocket = socket.into();
+        let udp_socket = UdpSocket::from_std(std_socket)?;
         let addr = udp_socket.local_addr().unwrap();
 
         let (in_udp_sender, mut in_udp_receiver) = channel::<UdpMessage>(4);

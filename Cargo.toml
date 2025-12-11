@@ -37,6 +37,7 @@ bytes = "1"
 backon = "1.5"
 dashmap = "6"
 ctrlc = "3.4"
+socket2 = "0.5"
 
 [dev-dependencies]
 jni = "0.21"

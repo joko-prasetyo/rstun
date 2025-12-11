@@ -16,6 +16,7 @@ use quinn::VarInt;
 use quinn::{congestion, Connection, Endpoint, SendStream, TransportConfig};
 use rs_utilities::log_and_bail;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Once};
 use tokio::net::TcpStream;
@@ -39,6 +40,9 @@ struct State {
     endpoint: Option<Endpoint>,
     tcp_sessions: Vec<ConnectedTcpInSession>,
     udp_sessions: Vec<ConnectedUdpInSession>,
+    // Track active IN tunnels by their bound address for session takeover
+    active_tcp_tunnels: HashMap<SocketAddr, (Connection, TcpServer)>,
+    active_udp_tunnels: HashMap<SocketAddr, (Connection, UdpServer)>,
 }
 
 impl State {
@@ -48,6 +52,8 @@ impl State {
             endpoint: None,
             tcp_sessions: Vec::new(),
             udp_sessions: Vec::new(),
+            active_tcp_tunnels: HashMap::new(),
+            active_udp_tunnels: HashMap::new(),
         }
     }
 }
@@ -162,7 +168,7 @@ impl Server {
             let config = inner_state!(self, config).clone();
             tokio::spawn(async move {
                 let client_conn = client_conn.await?;
-                let tun_type = Self::authenticate_connection(&config, client_conn).await?;
+                let tun_type = Self::authenticate_connection(&config, client_conn, state.clone()).await?;
 
                 match tun_type {
                     TunnelType::TcpOut(info) => {
@@ -184,6 +190,7 @@ impl Server {
                     }
 
                     TunnelType::TcpIn(mut info) => {
+                        let upstream_addr = info.tcp_server.addr();
                         state
                             .lock()
                             .unwrap()
@@ -205,9 +212,16 @@ impl Server {
                         .await;
 
                         info.tcp_server.shutdown().await.ok();
+                        
+                        // Clean up the active tunnel tracking
+                        {
+                            let mut state = state.lock().unwrap();
+                            state.active_tcp_tunnels.remove(&upstream_addr);
+                        }
                     }
 
                     TunnelType::UdpIn(mut info) => {
+                        let upstream_addr = info.udp_server.addr();
                         state
                             .lock()
                             .unwrap()
@@ -229,6 +243,12 @@ impl Server {
                         .await;
 
                         info.udp_server.shutdown().await.ok();
+                        
+                        // Clean up the active tunnel tracking
+                        {
+                            let mut state = state.lock().unwrap();
+                            state.active_udp_tunnels.remove(&upstream_addr);
+                        }
                     }
                     TunnelType::DynamicUpstreamTcpOut(conn) => {
                         TcpTunnel::start_accepting(&conn, None, config.tcp_timeout_ms).await;
@@ -249,6 +269,7 @@ impl Server {
     async fn authenticate_connection(
         config: &ServerConfig,
         conn: quinn::Connection,
+        state: Arc<Mutex<State>>,
     ) -> Result<TunnelType> {
         let remote_addr = &conn.remote_address();
 
@@ -267,7 +288,7 @@ impl Server {
 
                 let tunnel_type = match login_info.tunnel {
                     Tunnel::NetworkBased(tunnel_config) => {
-                        Self::derive_tunnel_type(conn, &mut quic_send, &tunnel_config, config)
+                        Self::derive_tunnel_type(conn, &mut quic_send, &tunnel_config, config, state.clone())
                             .await?
                     }
                     Tunnel::ChannelBased(upstream_type) => match upstream_type {
@@ -292,6 +313,7 @@ impl Server {
         quic_send: &mut SendStream,
         tunnel_config: &TunnelConfig,
         config: &ServerConfig,
+        state: Arc<Mutex<State>>,
     ) -> Result<TunnelType> {
         let upstream_addr = match tunnel_config.upstream.upstream_type {
             UpstreamType::Tcp => {
@@ -316,23 +338,81 @@ impl Server {
 
             TunnelMode::In => match tunnel_config.upstream.upstream_type {
                 UpstreamType::Tcp => {
+                    // Session takeover: check if there's an existing tunnel on this port
+                    let existing_tunnel = {
+                        state.lock().unwrap().active_tcp_tunnels.remove(&upstream_addr)
+                    };
+                    
+                    if let Some((old_conn, mut old_server)) = existing_tunnel {
+                        info!(
+                            "Session takeover: closing existing TCP tunnel on {} from {}",
+                            upstream_addr,
+                            old_conn.remote_address()
+                        );
+                        // Close the old connection
+                        old_conn.close(VarInt::from_u32(1), b"session_takeover");
+                        // Shutdown the old server
+                        old_server.shutdown().await.ok();
+                        // Also remove from tcp_sessions
+                        {
+                            let mut state = state.lock().unwrap();
+                            state.tcp_sessions.retain(|sess| {
+                                sess.conn.stable_id() != old_conn.stable_id()
+                            });
+                        }
+                        // Small delay to ensure port is released
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+
                     let tcp_server = match TcpServer::bind_and_start(upstream_addr).await {
                         Ok(tcp_server) => tcp_server,
                         Err(e) => {
                             TunnelMessage::send_failure(
                                 quic_send,
-                                format!("udp server failed to bind at: {upstream_addr}"),
+                                format!("tcp server failed to bind at: {upstream_addr}"),
                             )
                             .await?;
                             log_and_bail!("tcp_IN login rejected: {e}");
                         }
                     };
 
+                    // Track this tunnel for future session takeover
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.active_tcp_tunnels.insert(upstream_addr, (conn.clone(), tcp_server.clone()));
+                    }
+
                     TunnelMessage::send(quic_send, &TunnelMessage::RespSuccess).await?;
                     TunnelType::TcpIn(TcpTunnelInInfo { conn, tcp_server })
                 }
 
                 UpstreamType::Udp => {
+                    // Session takeover: check if there's an existing tunnel on this port
+                    let existing_tunnel = {
+                        state.lock().unwrap().active_udp_tunnels.remove(&upstream_addr)
+                    };
+                    
+                    if let Some((old_conn, mut old_server)) = existing_tunnel {
+                        info!(
+                            "Session takeover: closing existing UDP tunnel on {} from {}",
+                            upstream_addr,
+                            old_conn.remote_address()
+                        );
+                        // Close the old connection
+                        old_conn.close(VarInt::from_u32(1), b"session_takeover");
+                        // Shutdown the old server
+                        old_server.shutdown().await.ok();
+                        // Also remove from udp_sessions
+                        {
+                            let mut state = state.lock().unwrap();
+                            state.udp_sessions.retain(|sess| {
+                                sess.conn.stable_id() != old_conn.stable_id()
+                            });
+                        }
+                        // Small delay to ensure port is released
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+
                     let udp_server = match UdpServer::bind_and_start(upstream_addr).await {
                         Ok(udp_server) => udp_server,
                         Err(e) => {
@@ -344,6 +424,12 @@ impl Server {
                             log_and_bail!("udp_IN login rejected: {e}");
                         }
                     };
+
+                    // Track this tunnel for future session takeover
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.active_udp_tunnels.insert(upstream_addr, (conn.clone(), udp_server.clone()));
+                    }
 
                     TunnelMessage::send(quic_send, &TunnelMessage::RespSuccess).await?;
                     TunnelType::UdpIn(UdpTunnelInInfo { conn, udp_server })
